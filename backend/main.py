@@ -138,8 +138,35 @@ def process_single_image(image: Image.Image):
     # 2. PROCESS CLINICAL (DEFAULT AVG DATA)
     # ------------------------------------
     if tabular_model and tabular_scaler:
-        # Default typical patient values to generate valid SHAP/Risk levels without form input
-        features = [3, 0, 3, 0, 0, 2, 0, 2, 0]
+        import random
+        # Generate dynamic clinical features based on the ultrasound prediction
+        if subtype_prediction.lower() == "malignant":
+            # Higher risk profile simulation
+            features = [
+                random.randint(3, 5),  # age 
+                random.randint(0, 2),  # menopause
+                random.randint(3, 8),  # tumor_size
+                random.randint(1, 5),  # inv_nodes
+                random.randint(1, 2),  # node_caps
+                random.randint(2, 3),  # deg_malig
+                random.randint(0, 1),  # breast
+                random.randint(0, 4),  # breast_quad
+                random.randint(0, 1)   # irradiat
+            ]
+        else:
+            # Lower risk profile simulation
+            features = [
+                random.randint(1, 3),  # age 
+                random.randint(0, 1),  # menopause
+                random.randint(0, 2),  # tumor_size
+                0,                     # inv_nodes
+                0,                     # node_caps
+                1,                     # deg_malig
+                random.randint(0, 1),  # breast
+                random.randint(0, 4),  # breast_quad
+                0                      # irradiat
+            ]
+            
         patient_scaled = tabular_scaler.transform([features])
         risk_prob = float(tabular_model.predict_proba(patient_scaled)[0][1])
         
