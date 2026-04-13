@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, Depends
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 import uvicorn
 import io
 import base64
@@ -7,7 +8,14 @@ import os
 import cv2
 import numpy as np
 from PIL import Image
-from typing import List
+from datetime import datetime, timedelta
+import jwt
+import bcrypt
+from pydantic import BaseModel
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import random
 
 try:
     import tensorflow as tf
@@ -15,7 +23,7 @@ try:
 except ImportError:
     pass
 
-from database import SessionLocal, PatientRecord, engine, Base
+from database import SessionLocal, PatientRecord, User, engine, Base
 from sqlalchemy.orm import Session
 
 # Create DB tables
@@ -39,6 +47,72 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# Auth Configuration
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "your_email@gmail.com"
+SENDER_PASSWORD = "your_app_password"
+
+# Temporary OTP Store (In-memory cache)
+otp_store = {}
+
+SECRET_KEY = "my_super_secret_key"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 1 week
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+
+def verify_password(plain_password, hashed_password):
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def get_password_hash(password):
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# Pydantic models for Auth
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    email: str
+    full_name: str
+    hospital_branch: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
 
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 RESNET_MODEL_KERAS = os.path.join(MODEL_DIR, "breast_cancer_model.keras")
@@ -204,10 +278,110 @@ def process_single_image(image: Image.Image):
         "shap_features": top_importance
     }
 
+@app.post("/api/signup")
+def signup(user_data: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.username == user_data.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+        
+    if len(user_data.password) > 70:
+        raise HTTPException(status_code=400, detail="Password must be less than 70 characters")
+    
+    hashed_password = get_password_hash(user_data.password)
+    db_user = User(
+        username=user_data.username,
+        email=user_data.email,
+        full_name=user_data.full_name,
+        hospital_branch=user_data.hospital_branch,
+        hashed_password=hashed_password
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return {"message": "User created successfully"}
+
+@app.post("/api/forgot-password")
+def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        return {"message": "If that email exists, an OTP has been sent."}
+
+    otp_code = str(random.randint(100000, 999999))
+    otp_store[req.email] = {
+        "otp": otp_code,
+        "expires": datetime.utcnow() + timedelta(minutes=10)
+    }
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = req.email
+        msg['Subject'] = "Your Dashboard Password Reset OTP"
+        body = f"Hello,\n\nYour OTP for resetting your password is: {otp_code}\n\nThis code expires in 10 minutes."
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"OTP Email sent successfully to {req.email}")
+    except Exception as e:
+        print(f"\n[CRITICAL DEV BYPASS] SMTP Server failed to send email: {e}")
+        print(f"[TESTING] THE MOCK OTP FOR {req.email} IS: {otp_code}\n")
+
+    return {"message": "If that email exists, an OTP has been sent."}
+
+@app.post("/api/reset-password")
+def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
+    if req.email not in otp_store:
+        raise HTTPException(status_code=400, detail="OTP expired or invalid.")
+    
+    otp_data = otp_store[req.email]
+    if datetime.utcnow() > otp_data["expires"]:
+        del otp_store[req.email]
+        raise HTTPException(status_code=400, detail="OTP has expired.")
+        
+    if otp_data["otp"] != req.otp:
+        raise HTTPException(status_code=400, detail="Incorrect OTP.")
+        
+    user = db.query(User).filter(User.email == req.email).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="User not found.")
+        
+    if len(req.new_password) > 70:
+        raise HTTPException(status_code=400, detail="Password must be less than 70 characters")
+        
+    user.hashed_password = get_password_hash(req.new_password)
+    db.commit()
+    del otp_store[req.email]
+    
+    return {"message": "Password has been successfully reset."}
+
+@app.post("/api/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "username": user.username
+    }
+
 @app.post("/api/predict/comprehensive")
 async def predict_comprehensive(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """
     Single Endpoint. Stripped of complex clinical form data inputs.
@@ -232,39 +406,7 @@ async def predict_comprehensive(
     
     return result
 
-@app.post("/api/predict/batch")
-async def predict_batch(
-    files: List[UploadFile] = File(...),
-    db: Session = Depends(get_db)
-):
-    """
-    Process multiple ultrasound scans at once.
-    """
-    results = []
-    for file in files:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
-        
-        result = process_single_image(image)
-        result["filename"] = file.filename
-        results.append(result)
-        
-        # Save each to Database
-        record = PatientRecord(
-            filename=file.filename,
-            subtype=result["subtype"],
-            confidence=result["confidence"],
-            recurrence_risk=result["recurrence_prob"],
-            risk_group=result["risk_group"],
-            gradcam_base64=result["gradcam_image"]
-        )
-        db.add(record)
-    
-    db.commit()
-    
-    # Sort results by recurrence prob (highest first so docs know who to triage quickly)
-    results.sort(key=lambda x: x["recurrence_prob"], reverse=True)
-    return results
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
